@@ -73,10 +73,7 @@ pub fn build(b: *std.Build) !void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    const ssl_enabled = b.option(bool, "ssl", "enable ssl") orelse switch (target.result.os.tag) {
-        .macos => false, // there's an issue building openssl on macos
-        else => true,
-    };
+    const ssl_enabled = b.option(bool, "ssl", "enable ssl") orelse false;
 
     const libs_host: Libs = .{ .zlib = null, .openssl = null };
     const libs_target: Libs = .{
@@ -206,10 +203,11 @@ pub fn build(b: *std.Build) !void {
         break :blk_deepfreeze_c .{ frozen_headers, deepfreeze_c };
     };
 
+    const pyconfig_target = try addPyconfig(b, version, upstream, target, libs_target, configquery_exe);
     const final_exe = addPythonExe(b, upstream, target, optimize, .{
         .name = "python",
         .makesetup_out = makesetup_target,
-        .pyconfig = try addPyconfig(b, version, upstream, target, libs_target, configquery_exe),
+        .pyconfig = pyconfig_target,
         .stage = .{
             .final = .{
                 .stage2 = stage2_frozen_mods,
@@ -225,6 +223,29 @@ pub fn build(b: *std.Build) !void {
         .install_subdir = "",
     });
     b.getInstallStep().dependOn(&install_final.step);
+
+    const embed_exe = addPythonExe(b, upstream, target, optimize, .{
+        .name = "embed_python",
+        .root_source_file = b.path("embed_python.zig"),
+        .makesetup_out = makesetup_target,
+        .pyconfig = pyconfig_target,
+        .stage = .{
+            .final = .{
+                .stage2 = stage2_frozen_mods,
+                .frozen_headers = frozen_headers,
+                .deepfreeze_c = deepfreeze_c,
+            },
+        },
+    });
+    const install_embed = b.addInstallArtifact(embed_exe, .{});
+    b.getInstallStep().dependOn(&install_embed.step);
+
+    const run_embed = b.addRunArtifact(embed_exe);
+    if (b.args) |args| {
+        run_embed.addArgs(args);
+    }
+    const run_embed_step = b.step("run-embed", "Run the embedded python program");
+    run_embed_step.dependOn(&run_embed.step);
 
     const ci_step = b.step("ci", "The build/test step to run on the CI");
     ci_step.dependOn(b.getInstallStep());
@@ -436,6 +457,7 @@ fn addPythonExe(
         makesetup_out: std.Build.LazyPath,
         pyconfig: Pyconfig,
         stage: PythonExeStage,
+        root_source_file: ?std.Build.LazyPath = null,
     },
 ) *std.Build.Step.Compile {
     const exe = b.addExecutable(.{
@@ -444,10 +466,10 @@ fn addPythonExe(
             .target = target,
             .optimize = optimize,
             .link_libc = true,
+            .root_source_file = args.root_source_file,
         }),
     });
 
-    exe.root_module.addCMacro("Py_BUILD_CORE", "");
     exe.root_module.addCMacro("_GNU_SOURCE", "");
     switch (optimize) {
         .Debug => {},
@@ -492,6 +514,7 @@ fn addPythonExe(
     }
 
     const flags_common = [_][]const u8{
+        "-DPy_BUILD_CORE",
         "-fwrapv",
         "-std=c11",
         "-fvisibility=hidden",
@@ -584,11 +607,17 @@ fn addPythonExe(
                 },
             }),
             .final => concat(b.allocator, &.{
-                &.{
-                    "Programs/python.c",
-                    "Modules/getbuildinfo.c",
-                    "Python/frozen.c",
-                },
+                if (args.root_source_file == null)
+                    &[_][]const u8{
+                        "Programs/python.c",
+                        "Modules/getbuildinfo.c",
+                        "Python/frozen.c",
+                    }
+                else
+                    &[_][]const u8{
+                        "Modules/getbuildinfo.c",
+                        "Python/frozen.c",
+                    },
                 switch (args.pyconfig.version) {
                     .@"3.11.13" => &library_src_omit_frozen.@"3.11.13",
                     .@"3.12.11" => &library_src_omit_frozen.@"3.12.11",
